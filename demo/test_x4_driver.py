@@ -11,15 +11,16 @@ from demo.x4_driver import (
     LaserFan,
     LaserPoint,
     LidarSettings,
+    RozetaSdk,
+    RozetaScanPoint,
     ScanFrame,
     SimulatedX4,
-    YdlidarSdk,
 )
 from demo.x4_visualizer import angle_in_sector, valid_points
 
 
 class AbiLayoutTests(unittest.TestCase):
-    def test_packed_c_structures_match_sdk(self) -> None:
+    def test_legacy_sdk_layout_is_preserved_for_fixture_coverage(self) -> None:
         self.assertEqual(ctypes.sizeof(LaserPoint), 12)
         self.assertEqual(ctypes.sizeof(LaserConfig), 28)
         self.assertEqual(ctypes.sizeof(LaserFan), 40 + ctypes.sizeof(ctypes.c_void_p))
@@ -68,14 +69,15 @@ class RegionOfInterestTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "nt", "Windows DLL integration test")
-class NativeSdkTests(unittest.TestCase):
-    def test_built_sdk_loads_and_exports_c_api(self) -> None:
-        dll = Path(__file__).resolve().parents[1] / "build-x4" / "ydlidar_sdk.dll"
+class NativeRozetaTests(unittest.TestCase):
+    def test_built_rozeta_loads_and_exports_x4_c_api(self) -> None:
+        dll = Path(os.environ.get("ROZETA_DLL", Path(__file__).resolve().parents[2] / "rozeta" / "build-x4" / "librozeta.dll"))
         if not dll.is_file():
-            self.skipTest("native SDK has not been built")
-        sdk = YdlidarSdk(dll)
-        self.assertEqual(sdk.version, "1.2.20")
+            self.skipTest("Rozeta X4 driver has not been built")
+        sdk = RozetaSdk(dll)
+        self.assertTrue(sdk.version)
         self.assertIsInstance(sdk.list_ports(), tuple)
+        self.assertEqual(ctypes.sizeof(RozetaScanPoint), 24)
 
 
 if __name__ == "__main__":

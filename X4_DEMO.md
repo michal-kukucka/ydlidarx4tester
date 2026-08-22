@@ -1,8 +1,11 @@
-# YDLIDAR X4 native driver + Python demo (Windows)
+# YDLIDAR X4 Rozeta driver + Python demo (Windows)
 
-This project uses the official YDLIDAR C/C++ SDK as the hardware driver and a
-small `ctypes` layer for Python. The Python code talks directly to the compiled
-`ydlidar_sdk.dll`; there is no reimplementation of the serial protocol.
+The reusable hardware driver lives in
+[Rozeta](https://github.com/michal-kukucka/rozeta): a native C++17
+`rozeta::lidar::YdLidarScanner` with an opaque C ABI. This project is its Python
+demo: `ctypes` loads `librozeta.dll`, asks for complete X4 revolutions, and
+draws the selected detection sector. The official SDK is no longer in the live
+data path.
 
 ## Hardware wiring
 
@@ -27,10 +30,13 @@ Open PowerShell in this directory and run:
 ```
 
 The script downloads a pinned portable GCC/CMake/Ninja toolchain, verifies its
-SHA-256, builds the official SDK as `build-x4\ydlidar_sdk.dll`, creates `.venv`,
-and runs offline tests. The GUI uses Python's built-in Tk toolkit, so no PyPI
-packages or global installs are needed. Extraction uses the public-domain
-standalone `7zr.exe` from [7-Zip](https://www.7-zip.org/).
+SHA-256, builds the sibling `michal-kukucka/rozeta` checkout with
+`ROZETA_WITH_YDLIDAR=ON`, creates `.venv`, and runs Rozeta's C++ and Python
+adapter tests. Clone Rozeta next to this tester or set `ROZETA_DIR` to its
+source directory first. The resulting driver is `rozeta\build-x4\librozeta.dll`.
+The GUI uses Python's built-in Tk toolkit, so no PyPI packages or global
+installs are needed. Extraction uses the public-domain standalone `7zr.exe`
+from [7-Zip](https://www.7-zip.org/).
 
 ## Run it
 
@@ -40,7 +46,7 @@ Test the complete visualization without hardware first:
 .\scripts\run_demo.ps1 -Simulate
 ```
 
-List COM ports visible to the native SDK:
+List COM ports visible to Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe .\demo\x4_visualizer.py --list-ports
@@ -70,11 +76,11 @@ The same selection can be supplied on the command line:
 
 Use `-ShowAll` to restore the full 360-degree view.
 
-Record raw points and enable SDK filters:
+Record raw points and change the warning distance:
 
 ```powershell
 .\scripts\run_demo.ps1 -Port COM4 -Record .\recordings\room.csv `
-  --sun-filter --glass-filter --danger-distance 0.8
+  --danger-distance 0.8
 ```
 
 Run without a GUI for logging or integration:
@@ -84,24 +90,24 @@ Run without a GUI for logging or integration:
   -Record .\recordings\scan.csv
 ```
 
-Use `--help` for angle/range cropping, fixed resolution, orientation, ignored
-angle windows, reconnect behavior, scan frequency (5-12 Hz), filtering, debug
-logging, CSV recording, and DLL selection.
+Use `--help` for range cropping, orientation, the forward sector, warning
+distance, CSV recording and the `--rozeta-dll` override. Some legacy SDK-only
+noise/filter options remain accepted for command-line compatibility but are not
+applied by Rozeta's X4 backend.
 
 ## X4 profile used by the driver
 
 | Property | Value |
 | --- | --- |
 | Serial baud rate | 128000 |
-| Protocol | Triangle |
-| Sample rate | 5 kHz |
+| Protocol | X4 triangle packet stream, native Rozeta parser |
 | Range | 0.12-10.0 m |
-| Scan frequency | 5-12 Hz, default 8 Hz |
-| Communication | Dual channel |
+| Scan assembly | One complete revolution per `read_scan` call |
+| Timing | 700 ms DTR motor spin-up, 1500 ms scan timeout |
 | Intensity | Not supported by X4 |
 | Motor control | USB adapter DTR |
-| Auto reconnect | Enabled |
+| Angle correction | X4 triangular-head correction enabled |
 
 Close the visualization window or press Ctrl+C in headless mode to stop scanning;
-the wrapper always calls `turnOff`, disconnects the serial port, and releases
-the SDK object.
+the wrapper always stops the motor, releases DTR, closes the serial port and
+destroys the Rozeta scanner handle.

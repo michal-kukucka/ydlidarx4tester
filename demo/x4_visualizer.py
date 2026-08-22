@@ -1,4 +1,4 @@
-"""Live YDLIDAR X4 visualizer using the native SDK C API."""
+"""Live YDLIDAR X4 visualizer using Rozeta's native C++ driver."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ try:
         LidarSettings,
         ScanFrame,
         YdlidarError,
-        YdlidarSdk,
+        RozetaSdk,
         open_source,
     )
 except ImportError:
@@ -24,7 +24,7 @@ except ImportError:
         LidarSettings,
         ScanFrame,
         YdlidarError,
-        YdlidarSdk,
+        RozetaSdk,
         open_source,
     )
 
@@ -73,13 +73,13 @@ class AcquisitionWorker(threading.Thread):
         self,
         settings: LidarSettings,
         simulate: bool,
-        sdk_dll: Optional[Path],
+        native_dll: Optional[Path],
         record: Optional[Path],
     ):
         super().__init__(name="x4-acquisition", daemon=True)
         self.settings = settings
         self.simulate = simulate
-        self.sdk_dll = sdk_dll
+        self.native_dll = native_dll
         self.record = record
         self.frames: queue.Queue[ScanFrame] = queue.Queue(maxsize=2)
         self.errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
@@ -90,7 +90,7 @@ class AcquisitionWorker(threading.Thread):
     def run(self) -> None:
         try:
             with CsvRecorder(self.record) as recorder:
-                with open_source(self.settings, self.simulate, self.sdk_dll) as source:
+                with open_source(self.settings, self.simulate, self.native_dll) as source:
                     version = source.device_version
                     self.source_description = (
                         f"{source.port} | firmware {version.firmware} | S/N {version.serial_number}"
@@ -126,8 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--port", help="serial data port, for example COM4")
-    parser.add_argument("--sdk-dll", type=Path, help="path to ydlidar_sdk.dll")
-    parser.add_argument("--list-ports", action="store_true", help="list SDK-visible serial ports")
+    parser.add_argument("--rozeta-dll", "--sdk-dll", dest="rozeta_dll", type=Path, help="path to Rozeta's librozeta.dll")
+    parser.add_argument("--list-ports", action="store_true", help="list Windows serial ports")
     parser.add_argument("--simulate", action="store_true", help="run the complete demo without hardware")
     parser.add_argument("--scan-frequency", type=float, default=8.0, help="motor scan frequency in Hz")
     parser.add_argument("--min-range", type=float, default=0.12, help="minimum accepted distance in metres")
@@ -255,7 +255,7 @@ def run_headless(args: argparse.Namespace, settings: LidarSettings) -> int:
     count = 0
     roi_center, roi_width = requested_roi(args)
     with CsvRecorder(args.record) as recorder:
-        with open_source(settings, args.simulate, args.sdk_dll) as source:
+        with open_source(settings, args.simulate, args.rozeta_dll) as source:
             version = source.device_version
             print(
                 f"Connected: {source.port}; firmware={version.firmware}; "
@@ -282,7 +282,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
     import tkinter as tk
     from tkinter import ttk
 
-    worker = AcquisitionWorker(settings, args.simulate, args.sdk_dll, args.record)
+    worker = AcquisitionWorker(settings, args.simulate, args.rozeta_dll, args.record)
     worker.start()
 
     root = tk.Tk()
@@ -569,9 +569,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.list_ports:
-            sdk = YdlidarSdk(args.sdk_dll)
+            sdk = RozetaSdk(args.rozeta_dll)
             ports = sdk.list_ports()
-            print(f"YDLIDAR SDK {sdk.version}")
+            print(f"Rozeta {sdk.version}")
             if ports:
                 for port in ports:
                     print(port)

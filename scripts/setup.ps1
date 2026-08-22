@@ -57,31 +57,30 @@ if (-not (Test-Path $venvPython)) {
 
 Write-Host "Python demo uses only the standard library; no packages to download."
 
-$buildDir = Join-Path $projectRoot "build-x4"
-Write-Host "Configuring the official YDLIDAR SDK as a native DLL..."
+$rozetaRoot = if ($env:ROZETA_DIR) { $env:ROZETA_DIR } else { Join-Path (Split-Path -Parent $projectRoot) "rozeta" }
+if (-not (Test-Path (Join-Path $rozetaRoot "CMakeLists.txt"))) {
+    throw "Rozeta source was not found at '$rozetaRoot'. Clone michal-kukucka/rozeta beside this repository or set ROZETA_DIR."
+}
+$buildDir = Join-Path $rozetaRoot "build-x4"
+Write-Host "Configuring Rozeta's native YDLIDAR X4 driver..."
 $configureArgs = @(
-    "-S", $projectRoot,
+    "-S", $rozetaRoot,
     "-B", $buildDir,
     "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DCMAKE_C_COMPILER=$(Join-Path $toolBin 'gcc.exe')",
     "-DCMAKE_CXX_COMPILER=$compiler",
     "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-    "-DBUILD_SHARED_LIBS=ON",
-    "-DBUILD_EXAMPLES=OFF",
-    "-DBUILD_TEST=OFF",
-    "-DBUILD_CSHARP=OFF",
-    "-DBUILD_SDK_INSTALL=OFF",
-    "-DCMAKE_DISABLE_FIND_PACKAGE_SWIG=TRUE",
-    "-DCMAKE_DISABLE_FIND_PACKAGE_PythonInterp=TRUE",
-    "-DCMAKE_DISABLE_FIND_PACKAGE_PythonLibs=TRUE",
-    "-DCMAKE_DISABLE_FIND_PACKAGE_GTest=TRUE"
+    "-DROZETA_BUILD_SHARED=ON",
+    "-DROZETA_BUILD_EXAMPLES=ON",
+    "-DROZETA_BUILD_TESTS=ON",
+    "-DROZETA_WITH_YDLIDAR=ON"
 )
 & $cmake @configureArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
 
-Write-Host "Building ydlidar_sdk.dll..."
-& $cmake --build $buildDir --target ydlidar_sdk --parallel
+Write-Host "Building Rozeta and its X4 console smoke example..."
+& $cmake --build $buildDir --parallel
 if ($LASTEXITCODE -ne 0) { throw "Native SDK build failed" }
 
 foreach ($runtimeName in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
@@ -95,10 +94,15 @@ foreach ($runtimeName in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthre
     }
 }
 
-$sdkDll = Join-Path $buildDir "ydlidar_sdk.dll"
-if (-not (Test-Path $sdkDll)) { throw "Build completed but $sdkDll was not produced" }
+$rozetaDll = Join-Path $buildDir "librozeta.dll"
+if (-not (Test-Path $rozetaDll)) { throw "Build completed but $rozetaDll was not produced" }
+$env:ROZETA_DLL = $rozetaDll
 
-Write-Host "Running offline ABI and scan simulation tests..."
+Write-Host "Running Rozeta's C++ test suite..."
+& $cmake --build $buildDir --target test
+if ($LASTEXITCODE -ne 0) { throw "Rozeta tests failed" }
+
+Write-Host "Running Python demo adapter and simulation tests..."
 Push-Location $projectRoot
 try {
     & $venvPython -m unittest demo.test_x4_driver
@@ -110,3 +114,4 @@ try {
 Write-Host ""
 Write-Host "Setup complete. Start offline: .\scripts\run_demo.ps1 -Simulate"
 Write-Host "Start hardware:              .\scripts\run_demo.ps1 -Port COM4"
+Write-Host "Rozeta DLL:                  $rozetaDll"

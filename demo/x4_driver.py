@@ -1,8 +1,4 @@
-"""Typed Python wrapper around the official YDLIDAR SDK C API.
-
-The X4 profile is intentionally explicit: 128000 baud, triangle protocol,
-5 kHz sample rate, dual-channel communication, and DTR motor control.
-"""
+"""YDLIDAR X4 Python demo adapter backed by the Rozeta C++ driver."""
 
 from __future__ import annotations
 
@@ -255,8 +251,8 @@ class YdlidarSdk:
         return tuple(ports)
 
 
-class X4Lidar:
-    """Owns one live YDLIDAR X4 connection."""
+class LegacyX4Lidar:
+    """Historical official-SDK adapter kept only for ABI-layout regression tests."""
 
     def __init__(self, sdk: YdlidarSdk, settings: LidarSettings):
         settings.validate()
@@ -411,6 +407,218 @@ class X4Lidar:
         self.close()
 
 
+class RozetaScanPoint(ctypes.Structure):
+    _fields_ = [
+        ("angle_deg", ctypes.c_double),
+        ("distance_m", ctypes.c_double),
+        ("valid", ctypes.c_int),
+    ]
+
+
+class RozetaX4Config(ctypes.Structure):
+    _fields_ = [
+        ("device", ctypes.c_char * 260),
+        ("baud_rate", ctypes.c_int),
+        ("read_timeout_ms", ctypes.c_int),
+        ("write_timeout_ms", ctypes.c_int),
+        ("motor_start_delay_ms", ctypes.c_int),
+        ("scan_timeout_ms", ctypes.c_int),
+        ("min_range_m", ctypes.c_double),
+        ("max_range_m", ctypes.c_double),
+        ("use_dtr_motor_control", ctypes.c_int),
+        ("apply_triangle_angle_correction", ctypes.c_int),
+    ]
+
+
+class RozetaSdk:
+    """Stable ctypes binding for Rozeta's optional X4 driver C ABI."""
+
+    def __init__(self, library_path: Optional[os.PathLike[str] | str] = None):
+        self.path = self._resolve_library(library_path)
+        self._dll_directory = None
+        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+            self._dll_directory = os.add_dll_directory(str(self.path.parent))
+        try:
+            self.lib = ctypes.CDLL(str(self.path))
+        except OSError as exc:
+            raise YdlidarError(f"Could not load Rozeta driver {self.path}: {exc}") from exc
+        self._declare_api()
+
+    @staticmethod
+    def _resolve_library(library_path: Optional[os.PathLike[str] | str]) -> Path:
+        repo = Path(__file__).resolve().parents[1]
+        supplied = Path(library_path).expanduser() if library_path else None
+        env_path = os.environ.get("ROZETA_DLL")
+        candidates = [
+            supplied,
+            Path(env_path).expanduser() if env_path else None,
+            repo.parent / "rozeta" / "build-x4" / "librozeta.dll",
+            repo / "build-rozeta" / "librozeta.dll",
+            repo / "librozeta.dll",
+        ]
+        for candidate in candidates:
+            if candidate and candidate.is_file():
+                return candidate.resolve()
+        checked = "\n  ".join(str(item) for item in candidates if item)
+        raise YdlidarError(
+            "Rozeta X4 driver DLL was not found. Build Rozeta with "
+            "-DROZETA_WITH_YDLIDAR=ON, then set ROZETA_DLL or pass --rozeta-dll. "
+            f"Checked:\n  {checked}"
+        )
+
+    def _declare_api(self) -> None:
+        lib = self.lib
+        lib.rozeta_version.argtypes = []
+        lib.rozeta_version.restype = ctypes.c_char_p
+        lib.rozeta_ydlidar_x4_default_config.argtypes = []
+        lib.rozeta_ydlidar_x4_default_config.restype = RozetaX4Config
+        lib.rozeta_ydlidar_x4_create.argtypes = [RozetaX4Config]
+        lib.rozeta_ydlidar_x4_create.restype = ctypes.c_void_p
+        lib.rozeta_ydlidar_x4_destroy.argtypes = [ctypes.c_void_p]
+        lib.rozeta_ydlidar_x4_destroy.restype = None
+        for name in ("rozeta_ydlidar_x4_initialize", "rozeta_ydlidar_x4_start", "rozeta_ydlidar_x4_stop"):
+            func = getattr(lib, name)
+            func.argtypes = [ctypes.c_void_p]
+            func.restype = ctypes.c_int
+        lib.rozeta_ydlidar_x4_read_scan.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(RozetaScanPoint),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        lib.rozeta_ydlidar_x4_read_scan.restype = ctypes.c_int
+        lib.rozeta_ydlidar_x4_last_scan_frequency_hz.argtypes = [ctypes.c_void_p]
+        lib.rozeta_ydlidar_x4_last_scan_frequency_hz.restype = ctypes.c_double
+        lib.rozeta_ydlidar_x4_last_error.argtypes = [ctypes.c_void_p]
+        lib.rozeta_ydlidar_x4_last_error.restype = ctypes.c_char_p
+
+    @property
+    def version(self) -> str:
+        value = self.lib.rozeta_version()
+        return value.decode(errors="replace") if value else "unknown"
+
+    @staticmethod
+    def list_ports() -> Tuple[str, ...]:
+        if os.name != "nt":
+            return tuple()
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM") as key:
+                values = []
+                index = 0
+                while True:
+                    try:
+                        _, value, _ = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    values.append(str(value))
+                    index += 1
+                return tuple(sorted(set(values)))
+        except OSError:
+            return tuple()
+
+
+class X4Lidar:
+    """Owns one X4 connection through Rozeta's tested C++ backend."""
+
+    def __init__(self, sdk: RozetaSdk, settings: LidarSettings):
+        settings.validate()
+        self.sdk = sdk
+        self.settings = settings
+        self.handle = ctypes.c_void_p()
+        self.started = False
+        self.port: Optional[str] = None
+        self.device_version: Optional[DeviceVersion] = None
+
+    def _error(self, prefix: str) -> YdlidarError:
+        raw = self.sdk.lib.rozeta_ydlidar_x4_last_error(self.handle)
+        detail = raw.decode(errors="replace") if raw else "unknown Rozeta error"
+        return YdlidarError(f"{prefix}: {detail}")
+
+    def open(self) -> "X4Lidar":
+        if self.handle.value:
+            return self
+        port = self.settings.port
+        if not port:
+            ports = self.sdk.list_ports()
+            if len(ports) != 1:
+                hint = "no serial ports found" if not ports else f"multiple serial ports found ({', '.join(ports)})"
+                raise YdlidarError(f"{hint}; pass --port COMx")
+            port = ports[0]
+        config = self.sdk.lib.rozeta_ydlidar_x4_default_config()
+        encoded = port.encode("ascii")
+        if len(encoded) >= len(config.device):
+            raise YdlidarError(f"serial device name is too long: {port}")
+        config.device = encoded
+        config.min_range_m = self.settings.min_range_m
+        config.max_range_m = self.settings.max_range_m
+        self.handle = ctypes.c_void_p(self.sdk.lib.rozeta_ydlidar_x4_create(config))
+        if not self.handle.value:
+            raise YdlidarError("Rozeta could not allocate an X4 scanner; ensure it was built with ROZETA_WITH_YDLIDAR=ON")
+        self.port = port
+        try:
+            if self.sdk.lib.rozeta_ydlidar_x4_initialize(self.handle) != 0:
+                raise self._error(f"could not initialize X4 on {port}")
+            if self.sdk.lib.rozeta_ydlidar_x4_start(self.handle) != 0:
+                raise self._error(f"could not start X4 motor/scan on {port}")
+            self.device_version = DeviceVersion(1, f"Rozeta {self.sdk.version}", "X4")
+            self.started = True
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def read_scan(self) -> ScanFrame:
+        if not self.started:
+            raise YdlidarError("X4 is not open")
+        points = (RozetaScanPoint * 2048)()
+        count = ctypes.c_size_t()
+        result = self.sdk.lib.rozeta_ydlidar_x4_read_scan(self.handle, points, len(points), ctypes.byref(count))
+        if result < 0:
+            raise self._error("failed to receive a complete scan")
+        if result > 0:
+            raise YdlidarError("Rozeta scan exceeded the demo buffer")
+        size = int(count.value)
+        if size == 0:
+            raise YdlidarError("Rozeta returned an empty scan")
+        angles = []
+        ranges = []
+        for index in range(size):
+            angle = math.radians(points[index].angle_deg)
+            if angle > math.pi:
+                angle -= 2.0 * math.pi
+            if self.settings.reversion:
+                angle = (angle + 2.0 * math.pi) % (2.0 * math.pi) - math.pi
+            if self.settings.inverted:
+                angle = -angle
+            angles.append(angle)
+            ranges.append(float(points[index].distance_m) if points[index].valid else 0.0)
+        frequency = float(self.sdk.lib.rozeta_ydlidar_x4_last_scan_frequency_hz(self.handle))
+        return ScanFrame(
+            stamp_ns=time.time_ns(),
+            angles_rad=tuple(angles),
+            ranges_m=tuple(ranges),
+            intensities=(0.0,) * size,
+            scan_frequency_hz=frequency,
+            angle_increment_rad=(2.0 * math.pi / size),
+            time_increment_s=(1.0 / frequency / size if frequency > 0.0 else 0.0),
+        )
+
+    def close(self) -> None:
+        if self.handle.value:
+            if self.started:
+                self.sdk.lib.rozeta_ydlidar_x4_stop(self.handle)
+                self.started = False
+            self.sdk.lib.rozeta_ydlidar_x4_destroy(self.handle)
+            self.handle = ctypes.c_void_p()
+
+    def __enter__(self) -> "X4Lidar":
+        return self.open()
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
 class SimulatedX4:
     """Deterministic 2-D room simulator for testing the complete UI offline."""
 
@@ -512,4 +720,4 @@ def open_source(
 ) -> X4Lidar | SimulatedX4:
     if simulate:
         return SimulatedX4(settings, realtime=realtime)
-    return X4Lidar(YdlidarSdk(library_path), settings)
+    return X4Lidar(RozetaSdk(library_path), settings)

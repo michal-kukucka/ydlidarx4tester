@@ -18,13 +18,15 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $demo = Join-Path $projectRoot "demo\x4_visualizer.py"
-$sdk = Join-Path $projectRoot "build-x4\ydlidar_sdk.dll"
+$rozetaRoot = if ($env:ROZETA_DIR) { $env:ROZETA_DIR } else { Join-Path (Split-Path -Parent $projectRoot) "rozeta" }
+$rozetaDll = Join-Path $rozetaRoot "build-x4\librozeta.dll"
 
-if (-not (Test-Path $python) -or (-not $Simulate -and -not (Test-Path $sdk))) {
+if (-not (Test-Path $python) -or (-not $Simulate -and -not (Test-Path $rozetaDll))) {
     throw "Project is not built yet. Run .\scripts\setup.ps1 first."
 }
 
 $demoArgs = @($demo)
+if (-not $Simulate) { $demoArgs += @("--rozeta-dll", $rozetaDll) }
 if ($Port) { $demoArgs += @("--port", $Port) }
 if ($Simulate) { $demoArgs += "--simulate" }
 if ($Headless) { $demoArgs += "--headless" }
