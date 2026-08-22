@@ -1,8 +1,12 @@
 ![YDLIDAR](doc/images/YDLidar.jpg  "YDLIDAR")
 
-> **YDLIDAR X4 on Windows:** this checkout includes a native C/C++ driver build,
-> direct Python binding, live detection visualizer, simulator, CSV recorder, and
-> one-command setup. Start with [X4_DEMO.md](X4_DEMO.md).
+> **YDLIDAR X4 on Windows:** this checkout is a live Python visualizer and
+> tester for the reusable native driver in
+> [Rozeta](https://github.com/michal-kukucka/rozeta). The demo loads
+> Rozeta's `librozeta.dll` through its stable C ABI; it does not use the
+> original SDK in the live data path. It includes a simulator, CSV recorder,
+> forward-sector detection and one-command setup. Start with
+> [X4_DEMO.md](X4_DEMO.md).
 
 # Table of Contents
 
