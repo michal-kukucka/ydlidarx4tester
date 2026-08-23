@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from demo.x4_driver import (
+    ROZETA_LIBRARY_NAMES,
     LaserConfig,
     LaserFan,
     LaserPoint,
@@ -68,13 +69,26 @@ class RegionOfInterestTests(unittest.TestCase):
         self.assertEqual(points, [(math.radians(-125.0), 4.0)])
 
 
-@unittest.skipUnless(os.name == "nt", "Windows DLL integration test")
 class NativeRozetaTests(unittest.TestCase):
+    """Loads the shared library this platform actually builds."""
+
+    @staticmethod
+    def _library_candidates() -> list[Path]:
+        override = os.environ.get("ROZETA_LIBRARY") or os.environ.get("ROZETA_DLL")
+        if override:
+            return [Path(override).expanduser()]
+        projects = Path(__file__).resolve().parents[2]
+        roots = [projects / "rozeta-x4", projects / "rozeta"]
+        rozeta_dir = os.environ.get("ROZETA_DIR")
+        if rozeta_dir:
+            roots.insert(0, Path(rozeta_dir).expanduser())
+        return [root / "build-x4" / name for root in roots for name in ROZETA_LIBRARY_NAMES]
+
     def test_built_rozeta_loads_and_exports_x4_c_api(self) -> None:
-        dll = Path(os.environ.get("ROZETA_DLL", Path(__file__).resolve().parents[2] / "rozeta" / "build-x4" / "librozeta.dll"))
-        if not dll.is_file():
+        library = next((path for path in self._library_candidates() if path.is_file()), None)
+        if library is None:
             self.skipTest("Rozeta X4 driver has not been built")
-        sdk = RozetaSdk(dll)
+        sdk = RozetaSdk(library)
         self.assertTrue(sdk.version)
         self.assertIsInstance(sdk.list_ports(), tuple)
         self.assertEqual(ctypes.sizeof(RozetaScanPoint), 24)

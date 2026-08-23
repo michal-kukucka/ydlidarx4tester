@@ -3,13 +3,42 @@
 from __future__ import annotations
 
 import ctypes
+import glob
 import math
 import os
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+
+
+IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
+
+# Every platform builds the same Rozeta target under a different file name.
+if IS_WINDOWS:
+    ROZETA_LIBRARY_NAMES = ("librozeta.dll", "rozeta.dll")
+    LEGACY_SDK_LIBRARY_NAMES = ("ydlidar_sdk.dll", "libydlidar_sdk.dll")
+    SETUP_COMMAND = ".\\scripts\\setup.ps1"
+    PORT_EXAMPLE = "COM4"
+    USB_DRIVER_HINT = "install the Silicon Labs CP210x VCP driver"
+elif IS_MACOS:
+    ROZETA_LIBRARY_NAMES = ("librozeta.dylib",)
+    LEGACY_SDK_LIBRARY_NAMES = ("libydlidar_sdk.dylib",)
+    SETUP_COMMAND = "./scripts/setup.sh"
+    PORT_EXAMPLE = "/dev/cu.usbserial-0001"
+    USB_DRIVER_HINT = (
+        "check that the adapter appears as /dev/cu.usbserial* or /dev/cu.SLAB_USBtoUART "
+        "(install the Silicon Labs CP210x VCP driver if it does not)"
+    )
+else:
+    ROZETA_LIBRARY_NAMES = ("librozeta.so",)
+    LEGACY_SDK_LIBRARY_NAMES = ("libydlidar_sdk.so",)
+    SETUP_COMMAND = "./scripts/setup.sh"
+    PORT_EXAMPLE = "/dev/ttyUSB0"
+    USB_DRIVER_HINT = "check that the adapter appears as /dev/ttyUSB* and that you are in the dialout group"
 
 
 YDLIDAR_TYPE_SERIAL = 0
@@ -151,18 +180,18 @@ class DeviceVersion:
 
 
 class YdlidarSdk:
-    """Loads and declares the ABI of ``ydlidar_sdk.dll``."""
+    """Loads and declares the ABI of the legacy ``ydlidar_sdk`` shared library."""
 
     def __init__(self, library_path: Optional[os.PathLike[str] | str] = None):
         self.path = self._resolve_library(library_path)
         self._dll_directory = None
-        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        if IS_WINDOWS and hasattr(os, "add_dll_directory"):
             self._dll_directory = os.add_dll_directory(str(self.path.parent))
         try:
             self.lib = ctypes.CDLL(str(self.path))
         except OSError as exc:
             raise YdlidarError(
-                f"Could not load {self.path}: {exc}. Run scripts\\setup.ps1 first."
+                f"Could not load {self.path}: {exc}. Run {SETUP_COMMAND} first."
             ) from exc
         self._declare_api()
 
@@ -170,22 +199,24 @@ class YdlidarSdk:
     def _resolve_library(library_path: Optional[os.PathLike[str] | str]) -> Path:
         repo = Path(__file__).resolve().parents[1]
         supplied = Path(library_path).expanduser() if library_path else None
-        env_path = os.environ.get("YDLIDAR_SDK_DLL")
+        env_path = os.environ.get("YDLIDAR_SDK_LIBRARY") or os.environ.get("YDLIDAR_SDK_DLL")
         candidates = [
             supplied,
             Path(env_path).expanduser() if env_path else None,
-            repo / "build-x4" / "ydlidar_sdk.dll",
-            repo / "build" / "ydlidar_sdk.dll",
-            repo / "build" / "Release" / "ydlidar_sdk.dll",
-            repo / "build" / "libydlidar_sdk.dll",
-            repo / "ydlidar_sdk.dll",
         ]
+        for name in LEGACY_SDK_LIBRARY_NAMES:
+            candidates += [
+                repo / "build-x4" / name,
+                repo / "build" / name,
+                repo / "build" / "Release" / name,
+                repo / name,
+            ]
         for candidate in candidates:
             if candidate and candidate.is_file():
                 return candidate.resolve()
         checked = "\n  ".join(str(p) for p in candidates if p)
         raise YdlidarError(
-            "ydlidar_sdk.dll was not found. Run scripts\\setup.ps1 first. "
+            f"{LEGACY_SDK_LIBRARY_NAMES[0]} was not found. Run {SETUP_COMMAND} first. "
             f"Checked:\n  {checked}"
         )
 
@@ -290,12 +321,12 @@ class LegacyX4Lidar:
             ports = self.sdk.list_ports()
             if not ports:
                 raise YdlidarError(
-                    "No serial ports found. Connect the X4 data USB and install the "
-                    "Silicon Labs CP210x VCP driver, then retry."
+                    "No serial ports found. Connect the X4 data USB and "
+                    f"{USB_DRIVER_HINT}, then retry."
                 )
             if len(ports) != 1:
                 joined = ", ".join(ports)
-                raise YdlidarError(f"Multiple serial ports found ({joined}); pass --port COMx")
+                raise YdlidarError(f"Multiple serial ports found ({joined}); pass --port {PORT_EXAMPLE}")
             port = ports[0]
 
         self.sdk.lib.os_init()
@@ -436,7 +467,7 @@ class RozetaSdk:
     def __init__(self, library_path: Optional[os.PathLike[str] | str] = None):
         self.path = self._resolve_library(library_path)
         self._dll_directory = None
-        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        if IS_WINDOWS and hasattr(os, "add_dll_directory"):
             self._dll_directory = os.add_dll_directory(str(self.path.parent))
         try:
             self.lib = ctypes.CDLL(str(self.path))
@@ -448,22 +479,26 @@ class RozetaSdk:
     def _resolve_library(library_path: Optional[os.PathLike[str] | str]) -> Path:
         repo = Path(__file__).resolve().parents[1]
         supplied = Path(library_path).expanduser() if library_path else None
-        env_path = os.environ.get("ROZETA_DLL")
+        env_path = os.environ.get("ROZETA_LIBRARY") or os.environ.get("ROZETA_DLL")
+        rozeta_dir = os.environ.get("ROZETA_DIR")
+        roots = [Path(rozeta_dir).expanduser()] if rozeta_dir else []
+        roots += [repo.parent / "rozeta-x4", repo.parent / "rozeta"]
         candidates = [
             supplied,
             Path(env_path).expanduser() if env_path else None,
-            repo.parent / "rozeta" / "build-x4" / "librozeta.dll",
-            repo / "build-rozeta" / "librozeta.dll",
-            repo / "librozeta.dll",
         ]
+        for name in ROZETA_LIBRARY_NAMES:
+            for root in roots:
+                candidates += [root / "build-x4" / name, root / "build" / name]
+            candidates += [repo / "build-rozeta" / name, repo / name]
         for candidate in candidates:
             if candidate and candidate.is_file():
                 return candidate.resolve()
         checked = "\n  ".join(str(item) for item in candidates if item)
         raise YdlidarError(
-            "Rozeta X4 driver DLL was not found. Build Rozeta with "
-            "-DROZETA_WITH_YDLIDAR=ON, then set ROZETA_DLL or pass --rozeta-dll. "
-            f"Checked:\n  {checked}"
+            f"Rozeta X4 driver library ({ROZETA_LIBRARY_NAMES[0]}) was not found. Build "
+            "Rozeta with -DROZETA_WITH_YDLIDAR=ON, then set ROZETA_LIBRARY or pass "
+            f"--rozeta-lib. Checked:\n  {checked}"
         )
 
     def _declare_api(self) -> None:
@@ -499,8 +534,12 @@ class RozetaSdk:
 
     @staticmethod
     def list_ports() -> Tuple[str, ...]:
-        if os.name != "nt":
-            return tuple()
+        if IS_WINDOWS:
+            return RozetaSdk._list_windows_ports()
+        return RozetaSdk._list_posix_ports()
+
+    @staticmethod
+    def _list_windows_ports() -> Tuple[str, ...]:
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM") as key:
@@ -516,6 +555,22 @@ class RozetaSdk:
                 return tuple(sorted(set(values)))
         except OSError:
             return tuple()
+
+    @staticmethod
+    def _list_posix_ports() -> Tuple[str, ...]:
+        if IS_MACOS:
+            # macOS exposes each USB serial adapter twice; /dev/cu.* is the
+            # callout device that does not block waiting for carrier detect,
+            # so it is the one a LiDAR must be opened through.
+            patterns = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*", "/dev/cu.SLAB*", "/dev/cu.wchusbserial*")
+        else:
+            patterns = ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/serial/by-id/*")
+        found = set()
+        for pattern in patterns:
+            found.update(glob.glob(pattern))
+        # Bluetooth serial profiles are never a wired X4 adapter.
+        found = {name for name in found if "Bluetooth" not in name}
+        return tuple(sorted(found))
 
 
 class X4Lidar:
@@ -543,11 +598,14 @@ class X4Lidar:
             ports = self.sdk.list_ports()
             if len(ports) != 1:
                 hint = "no serial ports found" if not ports else f"multiple serial ports found ({', '.join(ports)})"
-                raise YdlidarError(f"{hint}; pass --port COMx")
+                raise YdlidarError(f"{hint}; pass --port {PORT_EXAMPLE}")
             port = ports[0]
         config = self.sdk.lib.rozeta_ydlidar_x4_default_config()
         encoded = port.encode("ascii")
-        if len(encoded) >= len(config.device):
+        # config.device reads back as the NUL-terminated value, so measure the
+        # declared field instead: POSIX device paths are longer than "COM4".
+        device_capacity = RozetaX4Config.device.size
+        if len(encoded) >= device_capacity:
             raise YdlidarError(f"serial device name is too long: {port}")
         config.device = encoded
         config.min_range_m = self.settings.min_range_m

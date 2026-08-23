@@ -14,6 +14,8 @@ from typing import Optional, Sequence
 try:
     from .x4_driver import (
         LidarSettings,
+        PORT_EXAMPLE,
+        ROZETA_LIBRARY_NAMES,
         ScanFrame,
         YdlidarError,
         RozetaSdk,
@@ -22,6 +24,8 @@ try:
 except ImportError:
     from x4_driver import (  # type: ignore
         LidarSettings,
+        PORT_EXAMPLE,
+        ROZETA_LIBRARY_NAMES,
         ScanFrame,
         YdlidarError,
         RozetaSdk,
@@ -73,13 +77,13 @@ class AcquisitionWorker(threading.Thread):
         self,
         settings: LidarSettings,
         simulate: bool,
-        native_dll: Optional[Path],
+        native_library: Optional[Path],
         record: Optional[Path],
     ):
         super().__init__(name="x4-acquisition", daemon=True)
         self.settings = settings
         self.simulate = simulate
-        self.native_dll = native_dll
+        self.native_library = native_library
         self.record = record
         self.frames: queue.Queue[ScanFrame] = queue.Queue(maxsize=2)
         self.errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
@@ -90,7 +94,7 @@ class AcquisitionWorker(threading.Thread):
     def run(self) -> None:
         try:
             with CsvRecorder(self.record) as recorder:
-                with open_source(self.settings, self.simulate, self.native_dll) as source:
+                with open_source(self.settings, self.simulate, self.native_library) as source:
                     version = source.device_version
                     self.source_description = (
                         f"{source.port} | firmware {version.firmware} | S/N {version.serial_number}"
@@ -125,9 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Live polar/Cartesian visualization for a YDLIDAR X4",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--port", help="serial data port, for example COM4")
-    parser.add_argument("--rozeta-dll", "--sdk-dll", dest="rozeta_dll", type=Path, help="path to Rozeta's librozeta.dll")
-    parser.add_argument("--list-ports", action="store_true", help="list Windows serial ports")
+    parser.add_argument("--port", help=f"serial data port, for example {PORT_EXAMPLE}")
+    parser.add_argument(
+        "--rozeta-lib",
+        "--rozeta-dll",
+        "--sdk-dll",
+        dest="rozeta_lib",
+        type=Path,
+        help=f"path to Rozeta's {ROZETA_LIBRARY_NAMES[0]}",
+    )
+    parser.add_argument("--list-ports", action="store_true", help="list serial ports visible to this machine")
     parser.add_argument("--simulate", action="store_true", help="run the complete demo without hardware")
     parser.add_argument("--scan-frequency", type=float, default=8.0, help="motor scan frequency in Hz")
     parser.add_argument("--min-range", type=float, default=0.12, help="minimum accepted distance in metres")
@@ -255,7 +266,7 @@ def run_headless(args: argparse.Namespace, settings: LidarSettings) -> int:
     count = 0
     roi_center, roi_width = requested_roi(args)
     with CsvRecorder(args.record) as recorder:
-        with open_source(settings, args.simulate, args.rozeta_dll) as source:
+        with open_source(settings, args.simulate, args.rozeta_lib) as source:
             version = source.device_version
             print(
                 f"Connected: {source.port}; firmware={version.firmware}; "
@@ -278,11 +289,26 @@ def run_headless(args: argparse.Namespace, settings: LidarSettings) -> int:
     return 0
 
 
+def ui_font_family(root: "object") -> str:
+    """Pick a readable UI font that actually exists on this platform."""
+    import tkinter.font as tkfont
+
+    preferred = {
+        "darwin": ("SF Pro Text", "Helvetica Neue", "Lucida Grande"),
+        "win32": ("Segoe UI",),
+    }.get(sys.platform, ("DejaVu Sans", "Liberation Sans"))
+    available = set(tkfont.families(root))
+    for family in preferred:
+        if family in available:
+            return family
+    return tkfont.nametofont("TkDefaultFont").actual("family")
+
+
 def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
     import tkinter as tk
     from tkinter import ttk
 
-    worker = AcquisitionWorker(settings, args.simulate, args.rozeta_dll, args.record)
+    worker = AcquisitionWorker(settings, args.simulate, args.rozeta_lib, args.record)
     worker.start()
 
     root = tk.Tk()
@@ -290,8 +316,11 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
     root.geometry("1280x760")
     root.minsize(900, 520)
     style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
+    for theme in ("aqua", "vista", "clam"):
+        if theme in style.theme_names():
+            style.theme_use(theme)
+            break
+    ui_font = ui_font_family(root)
     root.columnconfigure(0, weight=1)
     root.columnconfigure(1, weight=1)
     root.rowconfigure(1, weight=1)
@@ -300,7 +329,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
         root,
         text="YDLIDAR X4 — waiting for first scan...",
         anchor="center",
-        font=("Segoe UI", 11, "bold"),
+        font=(ui_font, 11, "bold"),
     )
     title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
     polar_canvas = tk.Canvas(root, background="#07131f", highlightthickness=0)
@@ -405,7 +434,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
             )
             polar_canvas.create_text(
                 pcx + 5, pcy - radius + 9, text=f"{distance:g} m",
-                fill="#8fa8b7", anchor="w", font=("Segoe UI", 8), tags="static",
+                fill="#8fa8b7", anchor="w", font=(ui_font, 8), tags="static",
             )
         for angle_deg in range(0, 360, 30):
             angle = math.radians(angle_deg)
@@ -415,7 +444,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
             polar_canvas.create_line(pcx, pcy, x, y, fill="#1e3444", tags="static")
         polar_canvas.create_text(
             12, 12, text="POLAR — LiDAR angles", fill="#dcecf5",
-            anchor="nw", font=("Segoe UI", 10, "bold"), tags="static",
+            anchor="nw", font=(ui_font, 10, "bold"), tags="static",
         )
 
         grid_step = 1.0 if settings.max_range_m <= 10.0 else 2.0
@@ -443,7 +472,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
         )
         cart_canvas.create_text(
             12, 12, text="CARTESIAN — metres", fill="#dcecf5",
-            anchor="nw", font=("Segoe UI", 10, "bold"), tags="static",
+            anchor="nw", font=(ui_font, 10, "bold"), tags="static",
         )
 
     def point_colour(distance: float) -> str:
@@ -569,7 +598,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.list_ports:
-            sdk = RozetaSdk(args.rozeta_dll)
+            sdk = RozetaSdk(args.rozeta_lib)
             ports = sdk.list_ports()
             print(f"Rozeta {sdk.version}")
             if ports:
