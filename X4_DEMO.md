@@ -154,6 +154,76 @@ works). Some legacy SDK-only
 noise/filter options remain accepted for command-line compatibility but are not
 applied by Rozeta's X4 backend.
 
+## Camera twin and LiDAR calibration
+
+`demo/twin_capture.py` runs the X4 next to a USB webcam and records both in
+step, so the LiDAR's bearing scale can be tied to something a human can read.
+Capture needs `ffmpeg` on `PATH` and no PyPI packages: frames arrive as raw
+`rgb24` over a pipe (no encoder latency), Tk shows them, and each stored frame
+is written as PNG by a small encoder in `demo/camera_stream.py`.
+
+```bash
+.venv/bin/python demo/twin_capture.py --list-cameras
+.venv/bin/python demo/twin_capture.py --port /dev/cu.usbserial-0001 --rate 2 \
+    --session recordings/train_01
+.venv/bin/python demo/twin_capture.py --port /dev/cu.usbserial-0001 --headless \
+    --rate 2 --duration 60 --session recordings/train_02
+```
+
+The window shows the camera on the left and the polar scan on the right; the
+text box plus **Mark** writes an operator label against the current sample. A
+session directory holds `session.json`, `frames/*.png`, `samples.jsonl` (full
+scan, 15-degree sector minima, camera/LiDAR timestamp difference) and
+`labels.jsonl`. Timestamp difference stays within about +/-50 ms because the
+LiDAR runs in its own reader thread and the newest camera frame is paired with
+the revolution as it completes.
+
+### Deriving the calibration
+
+Walk in front of the pair, or move an obstacle across it, then fit:
+
+```bash
+.venv/bin/python demo/calibrate_twin.py recordings/train_01
+```
+
+The tool takes a per-pixel median as the static background, does the same per
+5-degree LiDAR bin, and matches what moved in the image against what came
+closer in the scan. A person is often not the nearest return (the LiDAR may
+stand against a wall or a mount) and is invisible whenever they walk behind the
+camera, so every sample offers several candidate clusters and a RANSAC-style
+vote picks the mapping that explains the most samples. It reports
+
+```
+camera axis  = +179.2 deg LiDAR bearing
+scale        = +0.0784 deg/px (horizontal FOV 50.2 deg, same handedness)
+```
+
+and writes `<session>/calibration.json` with the camera axis, degrees per
+pixel, and the **blind sectors** - bearings where a return is always present at
+close range, meaning the mount or cabling, not an obstacle.
+
+### Using the calibration
+
+`x4_visualizer.py` and `twin_capture.py` load the newest
+`recordings/*/calibration.json` unless `--calibration PATH` or
+`--no-calibration` says otherwise, and then:
+
+* aim the detection sector along the camera axis, unless `--forward-angle` /
+  `--field-of-view` were given explicitly;
+* drop returns inside the blind sectors (drawn dark red in the twin window);
+* report the nearest **cluster** rather than the nearest single return, so one
+  stray sample no longer raises a warning. `--cluster-points` sets how many
+  returns must agree (default 3).
+
+```bash
+.venv/bin/python demo/x4_visualizer.py --port /dev/cu.usbserial-0001
+# calibration recordings/train_01: camera axis +179.2 deg, FOV 50 deg, blind ...
+# nearest=2.820m at -163.8deg width=12deg n=23
+```
+
+Re-run a training session whenever the LiDAR or camera is remounted: the axis
+and the blind sectors describe one physical installation.
+
 ## X4 profile used by the driver
 
 | Property | Value |
