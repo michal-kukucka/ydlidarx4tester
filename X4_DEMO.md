@@ -171,7 +171,17 @@ is written as PNG by a small encoder in `demo/camera_stream.py`.
 ```
 
 The window shows the camera on the left and the polar scan on the right; the
-text box plus **Mark** writes an operator label against the current sample. A
+text box plus **Mark** writes an operator label against the current sample.
+
+Recording is bounded, because a session left running unattended will otherwise
+fill the disk: it stops at `--max-session-mb` (512 by default), stops again if
+the volume drops below `--min-free-mb` free, and skips samples in which neither
+the camera nor the LiDAR changed, storing an idle one every `--keepalive`
+seconds so the quiet stretch is still on record. `--record-idle` stores
+everything, and `--motion-luma` / `--motion-cells` / `--motion-bins` set how
+much change counts as motion. Skipped samples still appear live and still count
+towards `--samples`; only the frame and its scan go unwritten. A write that
+fails stops the recording and says so instead of freezing the window. A
 session directory holds `session.json`, `frames/*.png`, `samples.jsonl` (full
 scan, 15-degree sector minima, camera/LiDAR timestamp difference) and
 `labels.jsonl`. Timestamp difference stays within about +/-50 ms because the

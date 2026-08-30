@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +15,9 @@ from demo.calibration import (
     wrap180,
 )
 from demo.calibrate_twin import decode_png_rgb, fit_mapping, Observation
-from demo.camera_stream import encode_png, list_cameras
+from demo.camera_stream import CameraFrame, encode_png, list_cameras
+from demo.twin_capture import MotionGate, Sample, SessionWriter
+from demo.x4_driver import ScanFrame
 
 
 class PngRoundTripTests(unittest.TestCase):
@@ -142,6 +145,87 @@ class FitTests(unittest.TestCase):
 
     def test_fit_needs_enough_observations(self) -> None:
         self.assertIsNone(fit_mapping([], 640))
+
+
+def make_frame(value: int, width: int = 64, height: int = 48, patch: int = 0) -> CameraFrame:
+    rgb = bytearray([value]) * (width * height * 3)
+    for y in range(patch):
+        for x in range(patch):
+            index = (y * width + x) * 3
+            rgb[index:index + 3] = b"\xff\xff\xff"
+    return CameraFrame(stamp_ns=0, rgb=bytes(rgb), width=width, height=height, index=1)
+
+
+def make_scan(distance: float, points: int = 360) -> ScanFrame:
+    angles = tuple(math.radians(-180.0 + 360.0 * index / points) for index in range(points))
+    return ScanFrame(
+        stamp_ns=0,
+        angles_rad=angles,
+        ranges_m=(distance,) * points,
+        intensities=(0.0,) * points,
+        scan_frequency_hz=8.0,
+        angle_increment_rad=2.0 * math.pi / points,
+        time_increment_s=0.0,
+    )
+
+
+class MotionGateTests(unittest.TestCase):
+    def test_first_sample_is_always_written(self) -> None:
+        gate = MotionGate(18.0, 0.15, 0.0)
+        self.assertTrue(gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0))
+
+    def test_a_still_scene_is_skipped(self) -> None:
+        gate = MotionGate(18.0, 0.15, 0.0)
+        gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0)
+        for index in range(2, 6):
+            written = gate.should_write(Sample(index, make_scan(2.0), make_frame(100)), float(index))
+            self.assertFalse(written)
+        self.assertEqual(gate.skipped, 4)
+
+    def test_sensor_noise_below_the_cell_count_is_not_motion(self) -> None:
+        gate = MotionGate(18.0, 0.15, 0.0, min_cells=12)
+        gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0)
+        noisy = make_frame(100, patch=2)  # a handful of cells, as webcam grain looks
+        self.assertFalse(gate.should_write(Sample(2, make_scan(2.0), noisy), 1.0))
+
+    def test_camera_motion_is_written(self) -> None:
+        gate = MotionGate(18.0, 0.15, 0.0)
+        gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0)
+        self.assertTrue(gate.should_write(Sample(2, make_scan(2.0), make_frame(200)), 1.0))
+
+    def test_lidar_motion_alone_is_written(self) -> None:
+        gate = MotionGate(18.0, 0.15, 0.0)
+        gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0)
+        self.assertTrue(gate.should_write(Sample(2, make_scan(1.0), make_frame(100)), 1.0))
+
+    def test_keepalive_stores_an_idle_sample(self) -> None:
+        gate = MotionGate(18.0, 0.15, keepalive_s=10.0)
+        gate.should_write(Sample(1, make_scan(2.0), make_frame(100)), 0.0)
+        self.assertFalse(gate.should_write(Sample(2, make_scan(2.0), make_frame(100)), 5.0))
+        self.assertTrue(gate.should_write(Sample(3, make_scan(2.0), make_frame(100)), 10.0))
+
+
+class SessionBudgetTests(unittest.TestCase):
+    def test_writer_stops_at_its_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            writer = SessionWriter(Path(directory), {}, budget_bytes=4096, min_free_bytes=0)
+            self.assertTrue(writer.has_room())
+            writer.write_sample(Sample(1, make_scan(2.0), make_frame(100)))
+            self.assertFalse(writer.has_room())
+            self.assertIn("budget", writer.stopped_reason)
+
+    def test_writer_stops_when_the_volume_is_nearly_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            writer = SessionWriter(Path(directory), {}, min_free_bytes=1 << 62)
+            self.assertFalse(writer.has_room())
+            self.assertIn("free", writer.stopped_reason)
+
+    def test_unbudgeted_writer_keeps_room(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            writer = SessionWriter(Path(directory), {}, budget_bytes=0, min_free_bytes=0)
+            writer.write_sample(Sample(1, make_scan(2.0), make_frame(100)))
+            self.assertTrue(writer.has_room())
+            self.assertEqual(writer.count, 1)
 
 
 class CameraListingTests(unittest.TestCase):

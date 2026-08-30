@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import math
 import statistics
 import sys
@@ -108,8 +109,19 @@ def _raw_nearest(angles_deg: list[float], ranges_m: list[float]) -> Optional[dic
 class SessionWriter:
     """Writes frames and sample metadata into a session directory."""
 
-    def __init__(self, directory: Path, metadata: dict, calibration: Optional[Calibration] = None) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        metadata: dict,
+        calibration: Optional[Calibration] = None,
+        budget_bytes: int = 0,
+        min_free_bytes: int = 512 * 1024 * 1024,
+    ) -> None:
         self.calibration = calibration
+        self.budget_bytes = budget_bytes
+        self.min_free_bytes = min_free_bytes
+        self.bytes_written = 0
+        self.stopped_reason: Optional[str] = None
         self.directory = directory
         self.frames_dir = directory / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
@@ -119,11 +131,33 @@ class SessionWriter:
         self._lock = threading.Lock()
         self.count = 0
 
+    def has_room(self) -> bool:
+        """Refuse to fill the disk: a long unattended session must not run it dry."""
+        if self.stopped_reason is not None:
+            return False
+        if self.budget_bytes and self.bytes_written >= self.budget_bytes:
+            self.stopped_reason = f"session budget of {self.budget_bytes // (1024 * 1024)} MB reached"
+            return False
+        try:
+            free = shutil.disk_usage(self.directory).free
+        except OSError:
+            return True
+        if free < self.min_free_bytes:
+            self.stopped_reason = f"only {free // (1024 * 1024)} MB free on the session volume"
+            return False
+        return True
+
     def write_sample(self, sample: Sample) -> dict:
         angles, ranges = scan_arrays(sample.scan)
         frame_name = f"frame_{sample.index:05d}.png"
         # Level 1 keeps the per-sample encode near 60 ms; the files stay readable.
-        (self.frames_dir / frame_name).write_bytes(sample.frame.to_png(compression=1))
+        png = sample.frame.to_png(compression=1)
+        try:
+            (self.frames_dir / frame_name).write_bytes(png)
+        except OSError as error:
+            self.stopped_reason = f"could not write {frame_name}: {error}"
+            return summarize(sample, self.calibration)
+        self.bytes_written += len(png)
         record = {
             "index": sample.index,
             "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -139,10 +173,16 @@ class SessionWriter:
             "sectors": sector_summary(angles, ranges),
             "points": [[round(a, 3), round(d, 4)] for a, d in zip(angles, ranges) if d > 0.0],
         }
+        line = json.dumps(record) + "\n"
         with self._lock:
-            with self.samples_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
+            try:
+                with self.samples_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError as error:
+                self.stopped_reason = f"could not append to samples.jsonl: {error}"
+                return record
             self.count += 1
+            self.bytes_written += len(line)
         return record
 
     def write_label(self, index: int, text: str) -> None:
@@ -155,6 +195,83 @@ class SessionWriter:
         with self._lock:
             with self.labels_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
+
+
+class MotionGate:
+    """Decides whether a sample is worth storing.
+
+    A session left running while nobody is there produced 2.7 GB of identical
+    frames and filled the disk. Idle samples are still summarised and shown,
+    they are just not written, apart from a periodic keepalive so the session
+    still records that the scene was quiet.
+    """
+
+    def __init__(
+        self,
+        luma_delta: float,
+        range_delta_m: float,
+        keepalive_s: float,
+        min_cells: int = 12,
+        min_bins: int = 2,
+    ) -> None:
+        self.luma_delta = luma_delta
+        self.range_delta_m = range_delta_m
+        self.keepalive_s = keepalive_s
+        # Webcam grain and X4 edge jitter both trip a single-cell test, so a
+        # sample only counts as motion when several places change at once.
+        self.min_cells = min_cells
+        self.min_bins = min_bins
+        self._luma: Optional[list[int]] = None
+        self._ranges: Optional[dict[int, float]] = None
+        self._last_write = 0.0
+        self.skipped = 0
+
+    @staticmethod
+    def _luma_signature(frame: CameraFrame, cells: int = 24) -> list[int]:
+        """Mean luma of a coarse grid, cheap enough to run every sample."""
+        step_x = max(frame.width // cells, 1)
+        step_y = max(frame.height // cells, 1)
+        signature = []
+        stride = frame.width * 3
+        for y in range(0, frame.height, step_y):
+            for x in range(0, frame.width, step_x):
+                index = y * stride + x * 3
+                signature.append(
+                    (frame.rgb[index] * 299 + frame.rgb[index + 1] * 587 + frame.rgb[index + 2] * 114) // 1000
+                )
+        return signature
+
+    @staticmethod
+    def _range_signature(scan: ScanFrame) -> dict[int, float]:
+        minima: dict[int, float] = {}
+        for angle_rad, distance in zip(scan.angles_rad, scan.ranges_m):
+            if distance <= 0.0:
+                continue
+            key = int(math.degrees(angle_rad) // SECTOR_WIDTH_DEG)
+            if key not in minima or distance < minima[key]:
+                minima[key] = distance
+        return minima
+
+    def should_write(self, sample: Sample, now: float) -> bool:
+        luma = self._luma_signature(sample.frame)
+        ranges = self._range_signature(sample.scan)
+        moved = True
+        if self._luma is not None and self._ranges is not None and len(luma) == len(self._luma):
+            changed_cells = sum(1 for a, b in zip(luma, self._luma) if abs(a - b) >= self.luma_delta)
+            shared = set(ranges) & set(self._ranges)
+            changed_bins = sum(
+                1 for key in shared if abs(ranges[key] - self._ranges[key]) >= self.range_delta_m
+            )
+            moved = changed_cells >= self.min_cells or changed_bins >= self.min_bins
+        keepalive = self.keepalive_s > 0.0 and (now - self._last_write) >= self.keepalive_s
+        if moved or keepalive:
+            self._luma = luma
+            self._ranges = ranges
+            self._last_write = now
+            return True
+        self._luma = luma
+        self.skipped += 1
+        return False
 
 
 def summarize(sample: Sample, calibration: Optional[Calibration] = None) -> dict:
@@ -372,6 +489,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=int, default=0, help="stop after N recorded samples; 0 means unlimited")
     parser.add_argument("--no-record", action="store_true", help="show the twin without writing a session")
     parser.add_argument(
+        "--max-session-mb",
+        type=int,
+        default=512,
+        help="stop recording once the session reaches this size; 0 removes the limit",
+    )
+    parser.add_argument(
+        "--min-free-mb",
+        type=int,
+        default=512,
+        help="stop recording when the volume has less free space than this",
+    )
+    parser.add_argument(
+        "--record-idle",
+        action="store_true",
+        help="store every sample, even when neither camera nor LiDAR changed",
+    )
+    parser.add_argument("--motion-luma", type=float, default=18.0, help="luma step that counts as camera motion")
+    parser.add_argument("--motion-range", type=float, default=0.15, help="range step in metres that counts as motion")
+    parser.add_argument("--motion-cells", type=int, default=12, help="changed image cells needed to call it motion")
+    parser.add_argument("--motion-bins", type=int, default=2, help="changed LiDAR sectors needed to call it motion")
+    parser.add_argument(
+        "--keepalive",
+        type=float,
+        default=30.0,
+        help="store an idle sample at least this often in seconds; 0 disables",
+    )
+    parser.add_argument(
         "--min-points",
         type=int,
         default=200,
@@ -439,6 +583,7 @@ def run(args: argparse.Namespace) -> int:
     source = open_source(settings, simulate=args.simulate, library_path=args.rozeta_lib)
 
     writer: Optional[SessionWriter] = None
+    gate: Optional[MotionGate] = None
     lidar: Optional[LidarStream] = None
     window: Optional[TwinWindow] = None
     stop_reason = "finished"
@@ -473,11 +618,25 @@ def run(args: argparse.Namespace) -> int:
                 "calibration": calibration.to_dict() if calibration else None,
                 "notes": "angle_deg is the raw LiDAR bearing; nearest excludes calibrated blind sectors",
             }
-            writer = SessionWriter(directory, metadata, calibration)
+            writer = SessionWriter(
+                directory,
+                metadata,
+                calibration,
+                budget_bytes=args.max_session_mb * 1024 * 1024,
+                min_free_bytes=args.min_free_mb * 1024 * 1024,
+            )
             print(f"session: {directory}")
 
         started = time.monotonic()
         state = {"index": 0, "next_sample": started, "running": True}
+        if not args.record_idle:
+            gate = MotionGate(
+                args.motion_luma,
+                args.motion_range,
+                args.keepalive,
+                min_cells=args.motion_cells,
+                min_bins=args.motion_bins,
+            )
 
         def tick() -> Optional[dict]:
             frame = camera.latest()
@@ -492,10 +651,21 @@ def run(args: argparse.Namespace) -> int:
                 state["next_sample"] = now + (1.0 / args.rate if args.rate > 0 else 0.5)
                 state["index"] += 1
                 sample = Sample(index=state["index"], scan=scan, frame=frame)
-                recording = writer is not None and (window is None or window.recording.get())
+                recording = (
+                    writer is not None
+                    and (window is None or window.recording.get())
+                    and writer.has_room()
+                    and (gate is None or gate.should_write(sample, now))
+                )
                 # Without a session the sample is still summarised, so --no-record
-                # stays a live view with the same counters and stop conditions.
+                # and skipped idle samples stay a live view with the same counters.
                 record = writer.write_sample(sample) if recording else summarize(sample, calibration)
+                if writer is not None and writer.stopped_reason and not state.get("warned"):
+                    state["warned"] = True
+                    print(f"recording stopped: {writer.stopped_reason}", file=sys.stderr)
+                    if window is not None:
+                        window.recording.set(False)
+                        window.status.set(f"recording stopped: {writer.stopped_reason}")
             if args.duration > 0 and now - started >= args.duration:
                 state["running"] = False
             if args.samples > 0 and state["index"] >= args.samples:
@@ -526,7 +696,12 @@ def run(args: argparse.Namespace) -> int:
                 if not state["running"]:
                     window.root.destroy()
                     return
-                record = tick()
+                try:
+                    record = tick()
+                except Exception as error:  # a failed sample must not freeze the window
+                    record = None
+                    state["running"] = False
+                    print(f"error: {error}", file=sys.stderr)
                 frame = camera.latest()
                 scan = lidar.latest() if lidar else None
                 if frame is not None:
@@ -567,7 +742,11 @@ def run(args: argparse.Namespace) -> int:
         camera.close()
 
     if writer is not None:
-        print(f"{stop_reason}: {writer.count} samples in {writer.directory}")
+        skipped = f", {gate.skipped} idle samples skipped" if gate is not None else ""
+        size_mb = writer.bytes_written / (1024 * 1024)
+        print(f"{stop_reason}: {writer.count} samples ({size_mb:.0f} MB) in {writer.directory}{skipped}")
+        if writer.stopped_reason:
+            print(f"recording had stopped early: {writer.stopped_reason}")
     return 0
 
 
