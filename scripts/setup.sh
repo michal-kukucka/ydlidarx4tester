@@ -72,7 +72,7 @@ fi
 echo "Python demo uses only the standard library; no packages to download."
 
 echo "Running Python demo adapter and simulation tests..."
-ROZETA_LIBRARY="$rozeta_library" "$venv_python" -m unittest demo.test_x4_driver
+ROZETA_LIBRARY="$rozeta_library" "$venv_python" -m unittest demo.test_x4_driver demo.test_twin demo.test_fusion
 
 cat <<SUMMARY
 

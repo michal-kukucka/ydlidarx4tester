@@ -21,7 +21,9 @@ try:
         RozetaSdk,
         open_source,
     )
+    from .calibration import Calibration, cluster_obstacles, find_calibration, nearest_obstacle
 except ImportError:
+    from calibration import Calibration, cluster_obstacles, find_calibration, nearest_obstacle  # type: ignore
     from x4_driver import (  # type: ignore
         LidarSettings,
         PORT_EXAMPLE,
@@ -124,6 +126,29 @@ class AcquisitionWorker(threading.Thread):
                 pass
 
 
+def apply_calibration(args: argparse.Namespace, argv: Sequence[str]) -> Optional[Calibration]:
+    """Aim the sector and mask the mount from a recorded twin calibration.
+
+    Explicit command-line values always win; the calibration only fills in what
+    the operator did not state.
+    """
+    if args.no_calibration:
+        return None
+    try:
+        calibration = find_calibration(args.calibration)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"warning: could not read calibration: {error}", file=sys.stderr)
+        return None
+    if calibration is None:
+        return None
+    given = set(argv)
+    if not any(flag.startswith("--forward-angle") for flag in given):
+        args.forward_angle = calibration.camera_axis_deg
+    if not any(flag.startswith("--field-of-view") for flag in given) and calibration.horizontal_fov_deg > 0.0:
+        args.field_of_view = calibration.horizontal_fov_deg
+    return calibration
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Live polar/Cartesian visualization for a YDLIDAR X4",
@@ -175,6 +200,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--glass-filter", action="store_true", help="enable glass-reflection filtering")
     parser.add_argument("--debug", action="store_true", help="enable verbose native SDK diagnostics")
     parser.add_argument("--danger-distance", type=float, default=0.65, help="nearest-obstacle warning distance in metres")
+    parser.add_argument(
+        "--calibration",
+        help="calibration.json from a twin session (default: newest under recordings/)",
+    )
+    parser.add_argument("--no-calibration", action="store_true", help="ignore any recorded calibration")
+    parser.add_argument(
+        "--cluster-points",
+        type=int,
+        default=3,
+        help="returns that must agree before a cluster counts as an obstacle",
+    )
     parser.add_argument("--record", type=Path, help="write every received point to a CSV file")
     parser.add_argument("--headless", action="store_true", help="print scan summaries instead of opening a GUI")
     parser.add_argument("--frames", type=int, default=0, help="stop after N scans; 0 runs forever")
@@ -232,6 +268,7 @@ def valid_points(
     settings: LidarSettings,
     roi_center_deg: float = 0.0,
     roi_width_deg: float = 360.0,
+    calibration: Optional[Calibration] = None,
 ) -> list[tuple[float, float]]:
     return [
         (angle, distance)
@@ -240,7 +277,21 @@ def valid_points(
         and math.isfinite(distance)
         and settings.min_range_m <= distance <= settings.max_range_m
         and angle_in_sector(angle, roi_center_deg, roi_width_deg)
+        and not (calibration is not None and calibration.is_blind(math.degrees(angle)))
     ]
+
+
+def obstacles_from_points(
+    points: Sequence[tuple[float, float]],
+    calibration: Optional[Calibration] = None,
+    min_points: int = 3,
+):
+    """Cluster valid points (radians) into obstacles reported in degrees."""
+    return cluster_obstacles(
+        [(math.degrees(angle), distance) for angle, distance in points],
+        min_points=min_points,
+        calibration=calibration,
+    )
 
 
 def describe_frame(
@@ -248,12 +299,19 @@ def describe_frame(
     settings: LidarSettings,
     roi_center_deg: float = 0.0,
     roi_width_deg: float = 360.0,
+    calibration: Optional[Calibration] = None,
+    min_points: int = 3,
 ) -> str:
-    points = valid_points(frame, settings, roi_center_deg, roi_width_deg)
+    points = valid_points(frame, settings, roi_center_deg, roi_width_deg, calibration)
+    nearest = None
     if points:
-        bearing_rad, nearest = min(points, key=lambda point: point[1])
-        bearing = math.degrees(bearing_rad)
-        obstacle = f"nearest={nearest:.3f}m at {bearing:+.1f}deg"
+        nearest = obstacles_from_points(points, calibration, min_points)
+    if nearest:
+        closest = nearest[0]
+        obstacle = (
+            f"nearest={closest.distance_m:.3f}m at {closest.angle_deg:+.1f}deg "
+            f"width={closest.width_deg:.0f}deg n={closest.points}"
+        )
     else:
         obstacle = "nearest=n/a"
     return (
@@ -262,7 +320,9 @@ def describe_frame(
     )
 
 
-def run_headless(args: argparse.Namespace, settings: LidarSettings) -> int:
+def run_headless(
+    args: argparse.Namespace, settings: LidarSettings, calibration: Optional[Calibration] = None
+) -> int:
     count = 0
     roi_center, roi_width = requested_roi(args)
     with CsvRecorder(args.record) as recorder:
@@ -284,7 +344,10 @@ def run_headless(args: argparse.Namespace, settings: LidarSettings) -> int:
                     print(f"Transient scan failure ({consecutive_failures}/5): {exc}", file=sys.stderr)
                     continue
                 recorder.write(frame)
-                print(describe_frame(frame, settings, roi_center, roi_width), flush=True)
+                print(
+                    describe_frame(frame, settings, roi_center, roi_width, calibration, args.cluster_points),
+                    flush=True,
+                )
                 count += 1
     return 0
 
@@ -304,7 +367,9 @@ def ui_font_family(root: "object") -> str:
     return tkfont.nametofont("TkDefaultFont").actual("family")
 
 
-def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
+def run_gui(
+    args: argparse.Namespace, settings: LidarSettings, calibration: Optional[Calibration] = None
+) -> int:
     import tkinter as tk
     from tkinter import ttk
 
@@ -484,7 +549,7 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
 
     def draw_scan(frame: ScanFrame) -> None:
         center_deg, width_deg = current_roi()
-        points = valid_points(frame, settings, center_deg, width_deg)
+        points = valid_points(frame, settings, center_deg, width_deg, calibration)
         polar_canvas.delete("scan")
         cart_canvas.delete("scan")
         pcx, pcy, pscale = geometry(polar_canvas)
@@ -499,8 +564,11 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
             cy = ccy - distance * cscale * cos_angle
             polar_canvas.create_oval(px - 1.5, py - 1.5, px + 1.5, py + 1.5, fill=colour, outline="", tags="scan")
             cart_canvas.create_oval(cx - 1.5, cy - 1.5, cx + 1.5, cy + 1.5, fill=colour, outline="", tags="scan")
-        if points:
-            nearest_angle, nearest_range = min(points, key=lambda point: point[1])
+        obstacles = obstacles_from_points(points, calibration, args.cluster_points) if points else []
+        if obstacles:
+            closest = obstacles[0]
+            nearest_angle = math.radians(closest.angle_deg)
+            nearest_range = closest.distance_m
             nx = math.sin(nearest_angle)
             ny = math.cos(nearest_angle)
             for canvas, center_x, center_y, scale in (
@@ -516,13 +584,15 @@ def run_gui(args: argparse.Namespace, settings: LidarSettings) -> int:
                 text=(
                     f"{worker.source_description}  |  {len(points)} valid points  |  "
                     f"{frame.scan_frequency_hz:.2f} Hz  |  nearest {nearest_range:.3f} m "
-                    f"at {math.degrees(nearest_angle):+.1f} degrees  |  "
+                    f"at {closest.angle_deg:+.1f} degrees ({closest.points} pts, "
+                    f"{closest.width_deg:.0f}° wide)  |  "
                     f"ROI {center_deg:+.0f}° / {width_deg:.0f}°{warning}"
                 ),
                 foreground="#c5162e" if warning else "#17222b",
             )
         else:
-            title.configure(text=f"{worker.source_description} | no valid points")
+            detail = "no obstacle cluster" if points else "no valid points"
+            title.configure(text=f"{worker.source_description} | {detail}", foreground="#17222b")
 
     def on_roi_change(_value: object = None) -> None:
         center_deg, width_deg = current_roi()
@@ -607,10 +677,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
             print("No serial ports detected.")
             return 2
+        calibration = apply_calibration(args, list(argv) if argv is not None else sys.argv[1:])
         settings = settings_from_args(args)
+        if calibration is not None:
+            blind = ", ".join(
+                f"{sector.start_deg:+.0f}..{sector.end_deg:+.0f}" for sector in calibration.blind_sectors
+            )
+            print(
+                f"calibration {calibration.source}: camera axis {calibration.camera_axis_deg:+.1f} deg, "
+                f"FOV {calibration.horizontal_fov_deg:.0f} deg"
+                + (f", blind {blind}" if blind else "")
+            )
         if args.headless:
-            return run_headless(args, settings)
-        return run_gui(args, settings)
+            return run_headless(args, settings, calibration)
+        return run_gui(args, settings, calibration)
     except (OSError, ValueError, YdlidarError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
