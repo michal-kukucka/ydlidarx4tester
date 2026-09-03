@@ -34,6 +34,8 @@ if __package__ in (None, ""):
 
 from demo.calibration import Calibration, find_calibration, nearest_obstacle
 from demo.camera_stream import CameraError, CameraFrame, CameraStream, list_cameras
+from demo.fusion import FusedDetection, fuse
+from demo.rgb_obstacle import CameraObstacle, RgbObstacleError, RgbObstacleTracker
 from demo.x4_driver import LidarSettings, ScanFrame, YdlidarError, open_source
 
 SECTOR_WIDTH_DEG = 15.0
@@ -44,6 +46,7 @@ class Sample:
     index: int
     scan: ScanFrame
     frame: CameraFrame
+    fusion: Optional[FusedDetection] = None
 
 
 def sector_summary(angles_deg: list[float], ranges_m: list[float]) -> list[dict]:
@@ -171,6 +174,7 @@ class SessionWriter:
             "nearest": nearest_point(angles, ranges, self.calibration),
             "nearest_raw": _raw_nearest(angles, ranges),
             "sectors": sector_summary(angles, ranges),
+            "fusion": sample.fusion.to_dict() if sample.fusion else None,
             "points": [[round(a, 3), round(d, 4)] for a, d in zip(angles, ranges) if d > 0.0],
         }
         line = json.dumps(record) + "\n"
@@ -285,6 +289,7 @@ def summarize(sample: Sample, calibration: Optional[Calibration] = None) -> dict
         "scan_frequency_hz": round(sample.scan.scan_frequency_hz, 3),
         "point_count": sample.scan.point_count,
         "nearest": nearest_point(angles, ranges, calibration),
+        "fusion": sample.fusion.to_dict() if sample.fusion else None,
     }
 
 
@@ -340,6 +345,60 @@ class LidarStream:
         self._thread.join(timeout=2.0)
 
 
+class CameraDetector:
+    """Feeds camera frames to Rozeta's tracker at the rate they arrive.
+
+    The tracker's hysteresis counts frames, not seconds, so it has to see every
+    decoded frame and not only the recorded samples: at the default 2 samples
+    per second a five-frame trigger would otherwise take two and a half seconds.
+    """
+
+    def __init__(
+        self,
+        tracker: RgbObstacleTracker,
+        use_reference: bool = True,
+        settle_s: float = 2.0,
+    ) -> None:
+        self.tracker = tracker
+        self.use_reference = use_reference
+        self.settle_s = settle_s
+        self.reference: Optional[CameraFrame] = None
+        self.reference_index: Optional[int] = None
+        self._deadline = time.monotonic() + settle_s
+        self._last_index: Optional[int] = None
+        self.detection: Optional[CameraObstacle] = None
+
+    def capture_reference(self, frame: CameraFrame) -> None:
+        """Adopts this frame as the empty scene every later frame is judged against."""
+        self.reference = frame
+        self.reference_index = frame.index
+        self.tracker.reset()
+        self.detection = None
+
+    def observe(self, frame: CameraFrame) -> Optional[CameraObstacle]:
+        """Runs the tracker once per new frame; repeats are ignored."""
+        if frame.index == self._last_index:
+            return self.detection
+        self._last_index = frame.index
+        if self.use_reference and self.reference is None:
+            if time.monotonic() < self._deadline:
+                return None
+            self.capture_reference(frame)
+            return None
+        if self.reference is not None:
+            self.detection = self.tracker.update_ref(frame, self.reference)
+        else:
+            self.detection = self.tracker.update(frame)
+        return self.detection
+
+    @property
+    def waiting(self) -> bool:
+        return self.use_reference and self.reference is None
+
+    def close(self) -> None:
+        self.tracker.close()
+
+
 class TwinWindow:
     """Tk view: camera on the left, polar LiDAR plot on the right."""
 
@@ -348,6 +407,7 @@ class TwinWindow:
         args: argparse.Namespace,
         writer: Optional[SessionWriter],
         calibration: Optional[Calibration] = None,
+        detector: Optional["CameraDetector"] = None,
     ) -> None:
         import tkinter as tk
 
@@ -355,6 +415,7 @@ class TwinWindow:
         self.args = args
         self.writer = writer
         self.calibration = calibration
+        self.detector = detector
         self.root = tk.Tk()
         self.root.title("YDLIDAR X4 + camera twin")
         self.root.configure(bg="#101014")
@@ -390,8 +451,18 @@ class TwinWindow:
             activebackground="#101014",
             activeforeground="#d8d8e0",
         ).pack(side="left", padx=10)
+        if detector is not None and detector.use_reference:
+            tk.Button(controls, text="Reference", command=self.retake_reference).pack(side="left")
         self._photo = None
         self.last_sample_index = 0
+        self._frame = None
+
+    def retake_reference(self) -> None:
+        """Adopts the current view as empty: use it after the scene settles."""
+        if self.detector is None or self._frame is None:
+            return
+        self.detector.capture_reference(self._frame)
+        self.status.set(f"reference taken from frame {self._frame.index}")
 
     def mark(self) -> None:
         text = self.label_entry.get().strip()
@@ -401,13 +472,26 @@ class TwinWindow:
         self.label_entry.delete(0, self.tk.END)
         self.status.set(f"labelled sample {self.last_sample_index}: {text}")
 
-    def show_camera(self, frame: CameraFrame) -> None:
+    def show_camera(self, frame: CameraFrame, detection: Optional[CameraObstacle] = None) -> None:
         # Level 0 costs ~7 ms per frame; Tk only needs a container, not small files.
+        self._frame = frame
         self._photo = self.tk.PhotoImage(data=frame.to_png(compression=0))
         self.canvas_camera.delete("all")
         self.canvas_camera.create_image(0, 0, image=self._photo, anchor="nw")
+        if detection is None or detection.box is None:
+            return
+        x, y, width, height = detection.box
+        colour = "#ff6b4a" if detection.triggered else "#e0c04a"
+        self.canvas_camera.create_rectangle(x, y, x + width, y + height, outline=colour, width=2)
+        self.canvas_camera.create_text(
+            x + 2,
+            max(8, y - 8),
+            text=f"{detection.state_name} {detection.area_fraction * 100:.1f}%",
+            fill=colour,
+            anchor="w",
+        )
 
-    def show_scan(self, scan: ScanFrame) -> None:
+    def show_scan(self, scan: ScanFrame, fused: Optional[FusedDetection] = None) -> None:
         canvas = self.canvas_lidar
         canvas.delete("all")
         size = self.plot_size
@@ -469,7 +553,48 @@ class TwinWindow:
             y = cy - math.cos(angle_rad) * distance * scale
             colour = "#7fe0a0" if inside else "#4a5a66"
             canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5, outline="", fill=colour)
+        if fused is not None:
+            self._draw_fusion(canvas, cx, cy, radius, scale, fused)
         canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#e05050", outline="")
+
+    def _draw_fusion(self, canvas, cx: float, cy: float, radius: float, scale: float, fused) -> None:
+        """A ray along the camera bearing, and a ring on the matched cluster."""
+        from demo.fusion import AGREEMENT_BOTH, AGREEMENT_CAMERA_ONLY
+
+        colours = {AGREEMENT_BOTH: "#ff5c3a", AGREEMENT_CAMERA_ONLY: "#ffc14a"}
+        colour = colours.get(fused.agreement)
+        if colour is None or fused.bearing_deg is None:
+            return
+        bearing = math.radians(fused.bearing_deg)
+        canvas.create_line(
+            cx,
+            cy,
+            cx + math.sin(bearing) * radius,
+            cy - math.cos(bearing) * radius,
+            fill=colour,
+            dash=(4, 4),
+        )
+        if fused.width_deg:
+            half = fused.width_deg / 2.0
+            canvas.create_arc(
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
+                start=90.0 - (fused.bearing_deg + half),
+                extent=fused.width_deg,
+                outline=colour,
+                style="arc",
+            )
+        if fused.lidar is not None and fused.lidar.distance_m <= self.args.plot_range:
+            r = fused.lidar.distance_m * scale
+            angle = math.radians(fused.lidar.angle_deg)
+            x = cx + math.sin(angle) * r
+            y = cy - math.cos(angle) * r
+            canvas.create_oval(x - 7, y - 7, x + 7, y + 7, outline=colour, width=2)
+            canvas.create_text(
+                x + 10, y, text=f"{fused.lidar.distance_m:.2f}m", fill=colour, anchor="w"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -536,10 +661,81 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="width of the highlighted sector (default: the calibrated camera FOV)",
     )
+    parser.add_argument(
+        "--no-camera-detection",
+        action="store_true",
+        help="skip Rozeta's RGB obstacle tracker and show the LiDAR alone",
+    )
+    parser.add_argument(
+        "--no-reference",
+        action="store_true",
+        help="detect dark blobs only, instead of new objects against a background",
+    )
+    parser.add_argument(
+        "--reference-delay",
+        type=float,
+        default=2.0,
+        help="seconds of settling before the background reference is captured",
+    )
+    parser.add_argument(
+        "--diff-threshold",
+        type=float,
+        default=None,
+        help="per-channel step that counts as changed against the reference (0-255)",
+    )
+    parser.add_argument(
+        "--diff-coverage",
+        type=float,
+        default=None,
+        help="fraction of the region of interest that must change to call it an obstacle",
+    )
+    parser.add_argument(
+        "--dark-coverage",
+        type=float,
+        default=None,
+        help=(
+            "fraction of dark pixels that alone counts as an obstacle; the "
+            "default disables it while a reference background is in use"
+        ),
+    )
+    parser.add_argument(
+        "--dark-max-value",
+        type=float,
+        default=None,
+        help="brightness below which a pixel is dark, 0-1; this is what shapes the box",
+    )
+    parser.add_argument(
+        "--trigger-streak",
+        type=int,
+        default=None,
+        help="consecutive detecting frames before the tracker triggers",
+    )
+    parser.add_argument(
+        "--clear-streak",
+        type=int,
+        default=None,
+        help="consecutive clear frames before the tracker clears",
+    )
+    parser.add_argument(
+        "--match-tolerance",
+        type=float,
+        default=12.0,
+        help="bearing difference in degrees still counted as the same object",
+    )
     parser.add_argument("--plot-range", type=float, default=5.0, help="plot radius in metres")
     parser.add_argument("--min-range", type=float, default=0.12, help="minimum accepted distance in metres")
     parser.add_argument("--max-range", type=float, default=10.0, help="maximum accepted distance in metres")
     return parser
+
+
+def _load_sdk(library_path: Optional[str]):
+    """Loads Rozeta for the camera alone, when the LiDAR is simulated."""
+    from demo.x4_driver import RozetaSdk
+
+    try:
+        return RozetaSdk(library_path)
+    except YdlidarError as error:
+        raise RgbObstacleError(str(error)) from error
 
 
 def default_session_dir() -> Path:
@@ -584,6 +780,7 @@ def run(args: argparse.Namespace) -> int:
 
     writer: Optional[SessionWriter] = None
     gate: Optional[MotionGate] = None
+    detector: Optional[CameraDetector] = None
     lidar: Optional[LidarStream] = None
     window: Optional[TwinWindow] = None
     stop_reason = "finished"
@@ -600,6 +797,45 @@ def run(args: argparse.Namespace) -> int:
             f"lidar={getattr(source, 'port', 'SIMULATED')} "
             f"firmware={getattr(version, 'firmware', 'n/a')} points={first_scan.point_count}"
         )
+
+        if not args.no_camera_detection:
+            try:
+                # The simulated source has no library of its own to borrow.
+                sdk = getattr(source, "sdk", None)
+                # With a reference background the question is what is *new*, so
+                # the dark-pixel path must not trigger on its own: a dim room is
+                # half dark and would leave the tracker latched on for good.
+                dark_coverage = args.dark_coverage
+                if dark_coverage is None and not args.no_reference:
+                    dark_coverage = 1.0
+                tracker = RgbObstacleTracker(
+                    sdk if sdk is not None else _load_sdk(args.rozeta_lib),
+                    diff_threshold=args.diff_threshold,
+                    diff_coverage_threshold=args.diff_coverage,
+                    coverage_threshold=dark_coverage,
+                    dark_max_value=args.dark_max_value,
+                    trigger_streak=args.trigger_streak,
+                    clear_streak=args.clear_streak,
+                )
+            except RgbObstacleError as error:
+                print(f"warning: camera detection disabled: {error}", file=sys.stderr)
+            else:
+                detector = CameraDetector(
+                    tracker,
+                    use_reference=not args.no_reference,
+                    settle_s=args.reference_delay,
+                )
+                mode = "new objects against a reference background" if detector.use_reference else "dark blobs"
+                print(
+                    f"camera detection: {mode}, trigger {tracker.config.trigger_streak} frames / "
+                    f"clear {tracker.config.clear_streak}, match within {args.match_tolerance:.0f} deg"
+                )
+                if calibration is None:
+                    print(
+                        "warning: no calibration, so a camera detection has no bearing "
+                        "and cannot be matched to a LiDAR cluster",
+                        file=sys.stderr,
+                    )
 
         if not args.no_record:
             directory = Path(args.session) if args.session else default_session_dir()
@@ -639,18 +875,36 @@ def run(args: argparse.Namespace) -> int:
             )
 
         def tick() -> Optional[dict]:
+            nonlocal detector
             frame = camera.latest()
             scan = lidar.latest() if lidar else None
             if frame is None or scan is None:
                 return None
             if scan.point_count < args.min_points:
                 return None
+            if detector is not None:
+                try:
+                    detector.observe(frame)
+                except RgbObstacleError as error:
+                    print(f"camera detection stopped: {error}", file=sys.stderr)
+                    detector.close()
+                    detector = None
+            angles, ranges = scan_arrays(scan)
+            fused = fuse(
+                detector.detection if detector is not None else None,
+                list(zip(angles, ranges)),
+                calibration=calibration,
+                tolerance_deg=args.match_tolerance,
+                sector_centre_deg=args.forward_angle,
+                sector_width_deg=args.field_of_view,
+            )
+            state["fusion"] = fused
             record = None
             now = time.monotonic()
             if now >= state["next_sample"]:
                 state["next_sample"] = now + (1.0 / args.rate if args.rate > 0 else 0.5)
                 state["index"] += 1
-                sample = Sample(index=state["index"], scan=scan, frame=frame)
+                sample = Sample(index=state["index"], scan=scan, frame=frame, fusion=fused)
                 recording = (
                     writer is not None
                     and (window is None or window.recording.get())
@@ -683,14 +937,16 @@ def run(args: argparse.Namespace) -> int:
                         if nearest
                         else "n/a"
                     )
+                    fused = state.get("fusion")
+                    fusion_text = f" {fused.describe()}" if fused is not None else ""
                     print(
                         f"sample {record['index']:>4} points={record['point_count']:>4} "
                         f"scan={record['scan_frequency_hz']:.2f}Hz sync={record['sync_delta_ms']:+.0f}ms "
-                        f"nearest={near_text}"
+                        f"nearest={near_text}{fusion_text}"
                     )
                 time.sleep(0.02)
         else:
-            window = TwinWindow(args, writer, calibration)
+            window = TwinWindow(args, writer, calibration, detector)
 
             def refresh() -> None:
                 if not state["running"]:
@@ -705,9 +961,9 @@ def run(args: argparse.Namespace) -> int:
                 frame = camera.latest()
                 scan = lidar.latest() if lidar else None
                 if frame is not None:
-                    window.show_camera(frame)
+                    window.show_camera(frame, detector.detection if detector else None)
                 if scan is not None:
-                    window.show_scan(scan)
+                    window.show_scan(scan, state.get("fusion"))
                     near = nearest_point(*scan_arrays(scan), calibration)
                     near_text = (
                         f"{near['distance_m']:.2f} m at {near['angle_deg']:+.1f} deg ({near['points']} pts)"
@@ -717,9 +973,16 @@ def run(args: argparse.Namespace) -> int:
                     saved = writer.count if writer else 0
                     if record is not None:
                         window.last_sample_index = record["index"]
+                    fused = state.get("fusion")
+                    if detector is not None and detector.waiting:
+                        fusion_text = "  camera: waiting for the reference frame"
+                    elif fused is not None:
+                        fusion_text = f"  {fused.describe()}"
+                    else:
+                        fusion_text = ""
                     window.status.set(
                         f"points={scan.point_count}  scan={scan.scan_frequency_hz:.2f} Hz  "
-                        f"nearest={near_text}  samples={saved}"
+                        f"nearest={near_text}  samples={saved}{fusion_text}"
                     )
                 window.root.after(max(30, int(1000 / max(args.stream_fps, 1))), refresh)
 
@@ -733,6 +996,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
     finally:
+        if detector is not None:
+            detector.close()
         if lidar is not None:
             lidar.stop()
         try:

@@ -105,7 +105,7 @@ if ($LASTEXITCODE -ne 0) { throw "Rozeta tests failed" }
 Write-Host "Running Python demo adapter and simulation tests..."
 Push-Location $projectRoot
 try {
-    & $venvPython -m unittest demo.test_x4_driver
+    & $venvPython -m unittest demo.test_x4_driver demo.test_twin demo.test_fusion
     if ($LASTEXITCODE -ne 0) { throw "Offline tests failed" }
 } finally {
     Pop-Location
